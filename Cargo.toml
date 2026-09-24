@@ -1,0 +1,56 @@
+[package]
+name = "glint"
+version = "0.1.0"
+edition = "2024"
+description = "Fast image viewer: Win32 + Vulkan, decoding through the system's WIC."
+license = "MIT"
+repository = "https://github.com/Fitertom/resc_glint"
+
+[dependencies]
+# No "debug" feature: Debug impls for every Vulkan struct are dead weight in the binary.
+ash = { version = "0.38", default-features = false, features = ["loaded", "std"] }
+windows-link = "0.2"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_LibraryLoader",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[features]
+crashlog = []
+
+[build-dependencies]
+# Only to rasterise assets/logo.svg at build time; none of it reaches the exe.
+resvg = { version = "0.45", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Decoding happens in the system codec, so debug builds are fast enough to iterate with.
+[profile.crash]
+inherits = "release"
+debug = true
+strip = false
+
+[profile.dev]
+opt-level = 1
