@@ -28,7 +28,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture
 use windows_sys::Win32::UI::Shell::{DragFinish, DragQueryFileW, HDROP};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-pub use windows_sys::Win32::UI::WindowsAndMessaging::{IDC_ARROW, IDC_SIZEALL};
+pub use windows_sys::Win32::UI::WindowsAndMessaging::{IDC_ARROW, IDC_SIZEALL, IDC_SIZEWE};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Btn {
@@ -63,6 +63,8 @@ pub enum Ev {
     Quit,
     /// The tray icon: left click (open), or a command from its menu.
     Tray(TrayCmd),
+    /// A timer set with `set_timer` went off.
+    Timer(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -171,6 +173,75 @@ thread_local! {
 const COPYDATA_OPEN: usize = 0x5345_4549; // "SEEI"
 pub const WM_QUIT_HOST: u32 = WM_APP + 2;
 const CLASS: &str = "Glint";
+/// A detached window (`--window`) goes under a class of its own: `find_host` looks up the
+/// resident process by class, and must never hand a file to a reference window instead.
+const CLASS_DETACHED: &str = "Glint.Window";
+static DETACHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_detached() {
+    DETACHED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn is_detached() -> bool {
+    DETACHED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Above every window that is not topmost itself, or back among them.
+pub fn set_topmost(hwnd: HWND, on: bool) {
+    let after = if on { HWND_TOPMOST } else { HWND_NOTOPMOST };
+    // SAFETY: a window of ours.
+    unsafe { SetWindowPos(hwnd, after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE) };
+}
+
+/// The whole window's opacity, 0..1, applied by the compositor. Layered only while below 1:
+/// an opaque window stays an ordinary one, and its present path is untouched.
+pub fn set_opacity(hwnd: HWND, a: f32) {
+    // SAFETY: style bits and an attribute on a window of ours.
+    unsafe {
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let layered = ex & WS_EX_LAYERED as isize != 0;
+        if a >= 0.999 {
+            if layered {
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex & !(WS_EX_LAYERED as isize));
+            }
+            return;
+        }
+        if !layered {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED as isize);
+        }
+        SetLayeredWindowAttributes(hwnd, 0, (a.clamp(0.0, 1.0) * 255.0).round() as u8, LWA_ALPHA);
+    }
+}
+
+/// Size the window to show `w × h` (client pixels, caption included) around its current centre,
+/// kept inside the work area of its monitor.
+pub fn fit_to(hwnd: HWND, w: i32, h: i32) {
+    // SAFETY: queries and a move on a window of ours.
+    unsafe {
+        let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        GetWindowRect(hwnd, &mut r);
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = size_of::<MONITORINFO>() as u32;
+        GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi);
+        let wa = mi.rcWork;
+        let (w, h) = (w.min(wa.right - wa.left), h.min(wa.bottom - wa.top));
+        let (cx, cy) = ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+        let x = (cx - w / 2).clamp(wa.left, wa.right - w);
+        let y = (cy - h / 2).clamp(wa.top, wa.bottom - h);
+        SetWindowPos(hwnd, std::ptr::null_mut(), x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
+
+/// The work area of the window's monitor: width and height.
+pub fn work_size(hwnd: HWND) -> (i32, i32) {
+    // SAFETY: a query filling a struct of ours.
+    unsafe {
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = size_of::<MONITORINFO>() as u32;
+        GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi);
+        (mi.rcWork.right - mi.rcWork.left, mi.rcWork.bottom - mi.rcWork.top)
+    }
+}
 
 /// A file from Explorer through COM (`com_server`): handled as a hand-over from another launch.
 pub fn open_from_com(path: Option<PathBuf>) {
@@ -315,6 +386,17 @@ pub fn set_caption(height: i32, buttons: i32) {
     CAPTION.set((height, buttons));
 }
 
+/// Once, `ms` from now: `Ev::Timer(id)`. Set again, the same id starts over.
+pub fn set_timer(hwnd: HWND, id: usize, ms: u32) {
+    // SAFETY: a timer on a window of ours.
+    unsafe { SetTimer(hwnd, id, ms, None) };
+}
+
+pub fn kill_timer(hwnd: HWND, id: usize) {
+    // SAFETY: as above.
+    unsafe { KillTimer(hwnd, id) };
+}
+
 /// The pointer over the client area (`IDC_*`).
 pub fn set_cursor(id: windows_sys::core::PCWSTR) {
     CURSOR.set(id as usize);
@@ -388,7 +470,7 @@ pub fn create(title: &str, bg: u32, maximized: bool, visible: bool, placement: O
     // SAFETY: every struct is filled here and every string outlives its call.
     unsafe {
         let hinst = GetModuleHandleW(std::ptr::null());
-        let class = wide(CLASS);
+        let class = wide(if is_detached() { CLASS_DETACHED } else { CLASS });
         // The exe's own icon resource (group 1, written by `build.rs`), at the sizes the
         // system wants: one file for the exe, the taskbar and the window.
         let icon = |side| LoadImageW(hinst, 1 as _, IMAGE_ICON, side, side, LR_DEFAULTCOLOR) as HICON;
@@ -814,6 +896,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // Explorer restarted: the notification area is new and empty.
             m if m == taskbar_created() && m != 0 => {
                 tray_add(hwnd);
+                0
+            }
+            WM_TIMER => {
+                KillTimer(hwnd, wparam);
+                post(Ev::Timer(wparam));
                 0
             }
             crate::loader::WM_LOADED => {

@@ -15,7 +15,8 @@ pub const SLOT_CAPTION: usize = IMAGE_SLOTS;
 pub const SLOT_INFO: usize = IMAGE_SLOTS + 1;
 pub const SLOT_CARD: usize = IMAGE_SLOTS + 2;
 pub const SLOT_BAR: usize = IMAGE_SLOTS + 3;
-const SLOTS: usize = IMAGE_SLOTS + 4;
+pub const SLOT_TIP: usize = IMAGE_SLOTS + 4;
+const SLOTS: usize = IMAGE_SLOTS + 5;
 
 /// The staging buffer kept while hidden, and the least one made: a thumbnail, a caption and a
 /// screen-sized preview fit.

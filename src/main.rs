@@ -57,7 +57,7 @@ fn main() {
     START.get_or_init(|| (std::time::Instant::now(), std::env::var_os("GLINT_TRACE").is_some()));
     #[cfg(feature = "crashlog")]
     crashlog::install();
-    let arg = std::env::args_os().nth(1);
+    let mut arg = std::env::args_os().nth(1);
     let embedded = arg.as_ref().and_then(|a| a.to_str()).is_some_and(|a| a.eq_ignore_ascii_case("-Embedding") || a.eq_ignore_ascii_case("/Embedding"));
     // COM starts the server as `glint.exe -Embedding` when Explorer asks for it and no copy runs.
     let flag = arg.as_ref().and_then(|a| a.to_str()).filter(|a| a.starts_with("--") || a.eq_ignore_ascii_case("-Embedding") || a.eq_ignore_ascii_case("/Embedding")).map(|a| {
@@ -98,13 +98,32 @@ fn main() {
         }
         _ => {}
     }
+    // `--window <file> [l,t,r,b]`: a window of its own for one image, beside the viewer — no
+    // tray, no COM, not resident, its placement not saved over the viewer's.
+    let detached = flag.as_deref() == Some("--window");
+    let mut window_at = None;
+    if detached {
+        win::set_detached();
+        let mut rest = std::env::args_os().skip(2);
+        arg = rest.next();
+        window_at = rest.next().and_then(|a| {
+            let v: Vec<i32> = a.to_str()?.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+            (v.len() == 4).then(|| [v[0], v[1], v[2], v[3]])
+        });
+    }
     let background = flag.as_deref() == Some("--background");
     // (Started by COM, this copy must serve the call even beside a window that does not.)
     if background && !embedded && win::find_host().is_some() {
         return;
     }
-    let arg = if flag.is_some() { None } else { arg };
-    let cfg = config::Config::load();
+    let arg = if flag.is_some() && !detached { None } else { arg };
+    let mut cfg = config::Config::load();
+    if detached {
+        cfg.resident = false;
+        cfg.setup_done = true;
+        cfg.window = config::WindowMode::Normal;
+        cfg.placement = window_at.map(|r| (r, false));
+    }
     if !cfg.implicit_layers {
         // SAFETY: no other thread exists yet to read the environment.
         unsafe { std::env::set_var("VK_LOADER_LAYERS_DISABLE", "~implicit~") };

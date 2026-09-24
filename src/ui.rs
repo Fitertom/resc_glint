@@ -43,13 +43,19 @@ const LOGO_SIDE: usize = 64;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Button {
+    /// Opacity: a click steps through presets, the wheel over it fine-tunes.
+    Opacity,
+    NewWindow,
+    Pin,
     Settings,
     Min,
     Max,
     Close,
 }
 
-const BUTTONS: [Button; 4] = [Button::Settings, Button::Min, Button::Max, Button::Close];
+const BUTTONS: [Button; 7] = [Button::Opacity, Button::NewWindow, Button::Pin, Button::Settings, Button::Min, Button::Max, Button::Close];
+/// The lowest opacity there is: below that a window is lost.
+pub const MIN_OPACITY: f32 = 0.1;
 
 /// What can be clicked on the setup card.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -112,11 +118,19 @@ pub fn buttons_w(dpi: u32) -> i32 {
     scaled(BUTTON_W, dpi) * BUTTONS.len() as i32
 }
 
+/// A caption button's left and right edge in client x.
+pub fn button_x(b: Button, width: i32, dpi: u32) -> (i32, i32) {
+    let bw = scaled(BUTTON_W, dpi);
+    let k = BUTTONS.iter().position(|&o| o == b).unwrap_or(0) as i32;
+    let l = width - buttons_w(dpi) + bw * k;
+    (l, l + bw)
+}
+
 /// Which caption button is under a client point, if any.
 pub fn button_at(x: i32, y: i32, width: i32, dpi: u32) -> Option<Button> {
     let bw = scaled(BUTTON_W, dpi);
     let n = BUTTONS.len() as i32;
-    if y < 0 || y >= caption_h(dpi) || x < width - bw * n || x >= width {
+    if y < 0 || y >= caption_h(dpi) || x < width - buttons_w(dpi) || x >= width {
         return None;
     }
     Some(BUTTONS[((x - (width - bw * n)) / bw).clamp(0, n - 1) as usize])
@@ -256,7 +270,8 @@ impl Painter {
     }
 
     /// The caption: logo, file name, info at the right, then minimise / maximise / close.
-    pub fn caption(&mut self, dpi: u32, width: i32, title: &str, info: &str, hot: Option<Button>, pressed: bool, maximized: bool) -> Vec<u8> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn caption(&mut self, dpi: u32, width: i32, title: &str, info: &str, hot: Option<Button>, pressed: bool, maximized: bool, pinned: bool, opacity: f32) -> Vec<u8> {
         self.set_dpi(dpi);
         let h = caption_h(dpi);
         self.canvas(width, h);
@@ -265,7 +280,9 @@ impl Painter {
 
         let bw = scaled(BUTTON_W, dpi);
         let x0 = width - bw * BUTTONS.len() as i32;
-        let glyphs = ['\u{E713}', '\u{E921}', if maximized { '\u{E923}' } else { '\u{E922}' }, '\u{E8BB}'];
+        // Opacity (drawn as its percentage once below 100), open in a new window, pin (filled
+        // while pinned), settings, then the system three.
+        let glyphs = ['\u{E706}', '\u{E8A7}', if pinned { '\u{E841}' } else { '\u{E718}' }, '\u{E713}', '\u{E921}', if maximized { '\u{E923}' } else { '\u{E922}' }, '\u{E8BB}'];
         for (k, (b, g)) in BUTTONS.into_iter().zip(glyphs).enumerate() {
             let r = rect(x0 + bw * k as i32, x0 + bw * (k as i32 + 1));
             let is_hot = hot == Some(b);
@@ -273,7 +290,13 @@ impl Painter {
                 self.fill(r, if b == Button::Close { CLOSE_HOT } else if pressed { PRESSED } else { HOVER });
             }
             let c = if is_hot { if b == Button::Close { (255, 255, 255) } else { TEXT_HEAD } } else { TEXT_DIM };
-            self.text(&g.to_string(), self.icons, c, r, DT_CENTER);
+            let see_through = b == Button::Opacity && opacity < 0.999;
+            let c = if (b == Button::Pin && pinned) || see_through { ACCENT_HOT } else { c };
+            if see_through {
+                self.text(&format!("{:.0}%", opacity * 100.0), self.text, c, r, DT_CENTER);
+            } else {
+                self.text(&g.to_string(), self.icons, c, r, DT_CENTER);
+            }
         }
 
         let pad = scaled(10, dpi);

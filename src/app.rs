@@ -2,7 +2,7 @@
 
 use crate::config::Config;
 use crate::files;
-use crate::gpu::{Gpu, IMAGE_SLOTS, Quad, SLOT_BAR, SLOT_CAPTION, SLOT_CARD, SLOT_INFO};
+use crate::gpu::{Gpu, IMAGE_SLOTS, Quad, SLOT_BAR, SLOT_CAPTION, SLOT_CARD, SLOT_INFO, SLOT_TIP};
 use crate::loader::{FULL, Key, Loader, Msg, PREVIEW, THUMB, drop_later};
 use crate::ui::{self, Button, CardItem, Painter, Tool};
 use crate::wic::Img;
@@ -12,6 +12,19 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
+
+/// What a tooltip is about: a caption button or a toolbar button.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Tip {
+    Cap(Button),
+    Bar(Tool),
+}
+
+/// The pointer rests this long on a button before its tooltip shows.
+const TIP_DELAY_MS: u32 = 450;
+const TIMER_TIP: usize = 1;
+/// Dragging the opacity button: this many pixels sideways go from 10 % to 100 %.
+const OPACITY_DRAG_PX: i32 = 220;
 
 /// Zoom per wheel notch and per key press.
 const STEP: f64 = 1.2;
@@ -156,6 +169,20 @@ pub struct App {
     /// Start this exe with these arguments once the loop is over: the installed copy, after
     /// installing from wherever this one was run.
     pub relaunch: Option<(PathBuf, Vec<std::ffi::OsString>)>,
+    /// Kept above other windows, and seen through: for a reference laid over other work.
+    pinned: bool,
+    opacity: f32,
+    /// Pressed on the opacity button: where, at what opacity, and whether it has moved since
+    /// (it has: a drag; it has not: a click, which steps through the presets).
+    opacity_drag: Option<(i32, f32, bool)>,
+    /// The tooltip: what the pointer rests on, whether it shows yet, whether a press put it
+    /// away until the pointer moves on, and what the texture on the GPU says.
+    tip: Option<Tip>,
+    tip_on: bool,
+    tip_hushed: bool,
+    tip_key: String,
+    /// A detached window has been sized to its image once; after that the size is the user's.
+    sized: bool,
 }
 
 /// The setup card while it is open.
@@ -224,6 +251,14 @@ impl App {
             caption_key: String::new(),
             restore_max: win::placement(hwnd).1,
             relaunch: None,
+            pinned: false,
+            opacity: 1.0,
+            sized: false,
+            opacity_drag: None,
+            tip: None,
+            tip_on: false,
+            tip_hushed: false,
+            tip_key: String::new(),
         };
         // The tray icon belongs to the process that stays: the resident one.
         if a.cfg.resident {
@@ -539,6 +574,7 @@ impl App {
             self.fit = true;
             self.rot = 0;
         }
+        self.size_detached();
         self.apply_fit();
         self.chrome_dirty = true;
         self.dirty = true;
@@ -575,6 +611,140 @@ impl App {
         // Drawn at once, so the upload is done by the time the user flips to it.
         self.dirty = true;
         Some((i, tex))
+    }
+
+    /// A detached window takes its image's proportions once real pixels are there (a stand-in's
+    /// size is not always the file's): at most 60 % of the work area, never above 1:1.
+    fn size_detached(&mut self) {
+        if self.sized || !win::is_detached() || self.shown.as_ref().is_none_or(|t| t.rank == 0) {
+            return;
+        }
+        let Some((w, h)) = self.dims() else { return };
+        self.sized = true;
+        let (ww, wh) = win::work_size(self.hwnd);
+        let cap = ui::caption_h(self.dpi) as f64;
+        let k = (ww as f64 * 0.6 / w).min((wh as f64 * 0.6 - cap) / h).min(1.0);
+        let min = ui::scaled(420, self.dpi) as f64;
+        win::fit_to(self.hwnd, (w * k).round().max(min) as i32, (h * k + cap).round() as i32);
+    }
+
+    /// What the tooltip over `t` says: what the button does, and its key.
+    fn tip_text(&self, t: Tip) -> String {
+        match t {
+            Tip::Cap(b) => match b {
+                Button::Opacity => format!("Opacity {:.0}%  ·  drag, wheel or click  ·  [ ]", self.opacity * 100.0),
+                Button::NewWindow => "Open in a new window  ·  N".into(),
+                Button::Pin if self.pinned => "Unpin  ·  T".into(),
+                Button::Pin => "Keep on top  ·  T".into(),
+                Button::Settings => "Settings".into(),
+                Button::Min => "Minimize".into(),
+                Button::Max if win::is_maximized(self.hwnd) => "Restore".into(),
+                Button::Max => "Maximize".into(),
+                Button::Close => "Close".into(),
+            },
+            Tip::Bar(t) => match t {
+                Tool::Prev => "Previous  ·  ←".into(),
+                Tool::Next => "Next  ·  →".into(),
+                Tool::ZoomOut => "Zoom out  ·  −".into(),
+                Tool::ZoomIn => "Zoom in  ·  +".into(),
+                Tool::Fit => "Fit to window  ·  0".into(),
+                Tool::Actual => "Actual size  ·  1".into(),
+                Tool::Rotate => "Rotate  ·  R".into(),
+                Tool::Fullscreen if self.fs.on => "Exit fullscreen  ·  Esc".into(),
+                Tool::Fullscreen => "Fullscreen  ·  F".into(),
+                Tool::Delete => "Delete  ·  Del".into(),
+            },
+        }
+    }
+
+    /// After every event: follow the pointer from button to button. A tooltip shows after a
+    /// rest; while one is up the next button's shows at once, as the system's do. Dragging the
+    /// opacity shows its value live.
+    fn update_tip(&mut self) {
+        let dragging = self.opacity_drag.is_some_and(|d| d.2);
+        let target = if self.opacity_drag.is_some() {
+            Some(Tip::Cap(Button::Opacity))
+        } else if self.setup.is_some() {
+            None
+        } else {
+            self.hot.map(Tip::Cap).or(self.bar_hot.map(Tip::Bar))
+        };
+        if target != self.tip {
+            let was_on = self.tip_on;
+            self.tip = target;
+            self.tip_hushed = false;
+            self.tip_on = target.is_some() && was_on;
+            if target.is_some() && !self.tip_on {
+                win::set_timer(self.hwnd, TIMER_TIP, TIP_DELAY_MS);
+            } else if target.is_none() {
+                win::kill_timer(self.hwnd, TIMER_TIP);
+            }
+            self.dirty = true;
+        }
+        if dragging && !self.tip_on {
+            self.tip_on = true;
+            self.tip_hushed = false;
+            self.dirty = true;
+        }
+    }
+
+    /// The tooltip's quad: under a caption button, above a toolbar button, inside the window.
+    fn tip_quad(&mut self) -> Option<(usize, Quad)> {
+        let t = self.tip.filter(|_| self.tip_on)?;
+        let text = self.tip_text(t);
+        let key = format!("{text}|{}", self.dpi);
+        if key != self.tip_key || !self.gpu.has(SLOT_TIP) {
+            let (pw, ph, px) = self.painter.pill(self.dpi, &text);
+            self.gpu.upload(SLOT_TIP, pw, ph, &px).ok()?;
+            self.tip_key = key;
+        }
+        let (tw, th) = self.gpu.size_of(SLOT_TIP);
+        let (tw, th) = (tw as f64, th as f64);
+        let (w, h) = (self.size.0 as f64, self.size.1 as f64);
+        let gap = ui::scaled(6, self.dpi) as f64;
+        let (cx, y) = match t {
+            Tip::Cap(b) => {
+                let (l, r) = ui::button_x(b, self.size.0 as i32, self.dpi);
+                ((l + r) as f64 / 2.0, self.caption_h() as f64 + gap)
+            }
+            Tip::Bar(tool) => {
+                let r = self.bar_items.iter().find(|(o, _)| *o == tool)?.1;
+                ((self.bar_at.0 + (r.left + r.right) / 2) as f64, self.bar_at.1 as f64 - gap - th)
+            }
+        };
+        let x = (cx - tw / 2.0).round().clamp(gap, (w - tw - gap).max(gap));
+        let ndc = |x0: f64, y0: f64, x1: f64, y1: f64| [(x0 / w * 2.0 - 1.0) as f32, (y0 / h * 2.0 - 1.0) as f32, (x1 / w * 2.0 - 1.0) as f32, (y1 / h * 2.0 - 1.0) as f32];
+        Some((SLOT_TIP, Quad { rect: ndc(x, y, x + tw, y + th), m: [1.0, 0.0, 0.0, 1.0], o: [0.0, 0.0, 1.0, 1.0], bg: [0.0; 4] }))
+    }
+
+    /// Pin the window over the others, or let it go.
+    fn set_pinned(&mut self, on: bool) {
+        self.pinned = on;
+        win::set_topmost(self.hwnd, on);
+        self.chrome_dirty = true;
+        self.dirty = true;
+    }
+
+    fn set_opacity(&mut self, a: f32) {
+        let a = a.clamp(ui::MIN_OPACITY, 1.0);
+        if (a - self.opacity).abs() < 1e-4 {
+            return;
+        }
+        self.opacity = a;
+        win::set_opacity(self.hwnd, a);
+        self.chrome_dirty = true;
+        self.dirty = true;
+    }
+
+    /// The current image in a window of its own: a second process, a little down and to the
+    /// right of this window, which then takes the image's proportions.
+    fn open_detached(&mut self) {
+        let Some(p) = self.cur_path() else { return };
+        let (r, _) = win::placement(self.hwnd);
+        let d = ui::scaled(32, self.dpi);
+        let at = format!("{},{},{},{}", r[0] + d, r[1] + d, r[2] + d, r[3] + d);
+        let exe = std::env::current_exe().unwrap_or_default();
+        let _ = std::process::Command::new(exe).arg("--window").arg(&*p).arg(at).spawn();
     }
 
     /// Put the neighbours that are decoded on the GPU ahead of the flip: the next one in the
@@ -637,7 +807,7 @@ impl App {
     /// stay: those are what makes the next open instant.
     /// Remember where the window is, for the next start.
     fn save_placement(&mut self) {
-        if self.hidden {
+        if self.hidden || win::is_detached() {
             return;
         }
         self.set_fullscreen(false);
@@ -663,6 +833,12 @@ impl App {
         // The toolbar stays: the same next time, and drawing it again was a millisecond of
         // the next open.
         self.setup = None;
+        // Opened again, the viewer is an ordinary window: a pin and a see-through setting are
+        // for the reference at hand, not for the next photo.
+        if self.pinned {
+            self.set_pinned(false);
+        }
+        self.set_opacity(1.0);
         self.pill_text.clear();
         self.error = None;
         // One empty frame before hiding: shown again, the window must not flash the old photo
@@ -758,6 +934,10 @@ impl App {
                 }
             }
             0x51 => win::close(self.hwnd),
+            0x54 => self.set_pinned(!self.pinned),
+            0x4E => self.open_detached(),
+            VK_OEM_4 => self.set_opacity(self.opacity - 0.1),
+            VK_OEM_6 => self.set_opacity(self.opacity + 0.1),
             _ => {}
         }
     }
@@ -935,6 +1115,13 @@ impl App {
                     self.open_setup(false);
                 }
             }
+            Button::Pin => self.set_pinned(!self.pinned),
+            Button::NewWindow => self.open_detached(),
+            // 100 → 75 → 50 → 25 → 100: from wherever the wheel left it, the next preset down.
+            Button::Opacity => {
+                let next = [0.75, 0.5, 0.25].into_iter().find(|&p| p < self.opacity - 0.01).unwrap_or(1.0);
+                self.set_opacity(next);
+            }
             Button::Min => win::minimize(self.hwnd),
             Button::Max => win::toggle_maximize(self.hwnd),
             Button::Close => win::close(self.hwnd),
@@ -1061,11 +1248,17 @@ impl App {
         win::set_caption(self.caption_h(), if self.fs.on { 0 } else { ui::buttons_w(self.dpi) });
         if self.chrome_dirty && !self.fs.on && w > 0 {
             let title = self.cur_path().map_or_else(|| "Glint".to_string(), |p| p.file_name().unwrap_or_default().to_string_lossy().into_owned());
-            let info = self.info_line();
+            // Over the opacity button the info gives way to what it is set to.
+            let info = if self.hot == Some(Button::Opacity) {
+                format!("Opacity {:.0}%", self.opacity * 100.0)
+            } else {
+                self.info_line()
+            };
             let (pressed, max) = (self.pressed.is_some(), win::is_maximized(self.hwnd));
-            let key = format!("{title}|{info}|{:?}|{pressed}|{max}|{w}|{}", self.hot, self.dpi);
+            let hot = self.hot;
+            let key = format!("{title}|{info}|{hot:?}|{pressed}|{max}|{w}|{}|{}|{:.3}", self.dpi, self.pinned, self.opacity);
             if key != self.caption_key || !self.gpu.has(SLOT_CAPTION) {
-                let px = self.painter.caption(self.dpi, w as i32, &title, &info, self.hot, pressed, max);
+                let px = self.painter.caption(self.dpi, w as i32, &title, &info, hot, pressed, max, self.pinned, self.opacity);
                 match self.gpu.upload(SLOT_CAPTION, w, ui::caption_h(self.dpi) as u32, &px) {
                     Ok(()) => self.caption_key = key,
                     Err(e) => self.error = Some(e),
@@ -1078,7 +1271,38 @@ impl App {
 
 impl win::Handler for App {
     fn event(&mut self, e: Ev) {
+        self.handle(e);
+        self.update_tip();
+    }
+
+    fn frame(&mut self) {
+        self.draw_frame();
+    }
+}
+
+impl App {
+    fn handle(&mut self, e: Ev) {
         match e {
+            Ev::Timer(TIMER_TIP) => {
+                if self.tip.is_some() && !self.tip_hushed {
+                    self.tip_on = true;
+                    self.dirty = true;
+                }
+            }
+            // A press puts the tooltip away until the pointer goes to another button.
+            Ev::Button { down: true, .. } if self.tip.is_some() => {
+                self.tip_on = false;
+                self.tip_hushed = true;
+                self.dirty = true;
+                self.handle_input(e);
+            }
+            e => self.handle_input(e),
+        }
+    }
+
+    fn handle_input(&mut self, e: Ev) {
+        match e {
+            Ev::Timer(_) => {}
             Ev::Resize(w, h) => {
                 self.size = (w, h);
                 // A hidden window shown again reports the size it already had; rebuilding the
@@ -1126,6 +1350,17 @@ impl win::Handler for App {
                 }
             }
             Ev::Wheel { .. } if self.setup.is_some() => {}
+            Ev::MouseMove(x, _) if self.opacity_drag.is_some() => {
+                let Some((sx, start, moved)) = self.opacity_drag else { return };
+                let dx = x - sx;
+                let moved = moved || dx.abs() > ui::scaled(3, self.dpi);
+                self.opacity_drag = Some((sx, start, moved));
+                if moved {
+                    let span = ui::scaled(OPACITY_DRAG_PX, self.dpi) as f32;
+                    self.set_opacity(start + dx as f32 / span * (1.0 - ui::MIN_OPACITY));
+                    self.dirty = true;
+                }
+            }
             Ev::MouseMove(x, y) => {
                 let hover = self.drag.is_none() && self.in_bar_zone(y);
                 if hover != self.bar_hover {
@@ -1170,6 +1405,10 @@ impl win::Handler for App {
                 }
             }
             Ev::Button { b: Btn::Left, down: true, x, y } => match self.hot_at(x, y) {
+                Some(Button::Opacity) => {
+                    self.opacity_drag = Some((x, self.opacity, false));
+                    win::set_cursor(win::IDC_SIZEWE);
+                }
                 Some(b) => {
                     self.pressed = Some(b);
                     self.chrome_dirty = true;
@@ -1181,6 +1420,15 @@ impl win::Handler for App {
                 }
             },
             Ev::Button { b: Btn::Left, down: false, x, y } => {
+                if let Some((_, _, moved)) = self.opacity_drag.take() {
+                    win::set_cursor(win::IDC_ARROW);
+                    if !moved {
+                        self.button(Button::Opacity);
+                    }
+                    self.hot = self.hot_at(x, y);
+                    self.chrome_dirty = true;
+                    self.dirty = true;
+                }
                 if let Some(b) = self.pressed.take() {
                     self.chrome_dirty = true;
                     self.dirty = true;
@@ -1209,9 +1457,12 @@ impl win::Handler for App {
             // photo: the window class asks for double clicks, so Windows sends that press as
             // `WM_LBUTTONDBLCLK`, and a checkbox or a button clicked fast lost every other click.
             Ev::DoubleClick(x, y) if self.setup.is_some() || self.tool_at(x, y).is_some() || self.hot_at(x, y).is_some() => {
-                self.event(Ev::Button { b: Btn::Left, down: true, x, y });
+                self.handle_input(Ev::Button { b: Btn::Left, down: true, x, y });
             }
             Ev::DoubleClick(..) => self.set_fullscreen(!self.fs.on),
+            Ev::Wheel { notches, x, y } if self.hot_at(x, y) == Some(Button::Opacity) => {
+                self.set_opacity(self.opacity + 0.05 * notches);
+            }
             Ev::Wheel { notches, x, y } => {
                 let ctrl = unsafe { GetKeyState(VK_CONTROL as i32) } < 0;
                 if self.cfg.wheel_zoom != ctrl {
@@ -1286,7 +1537,7 @@ impl win::Handler for App {
         }
     }
 
-    fn frame(&mut self) {
+    fn draw_frame(&mut self) {
         if !self.dirty || self.hidden {
             return;
         }
@@ -1353,6 +1604,7 @@ impl win::Handler for App {
             quads.push((SLOT_CAPTION, Quad { rect: ndc(0.0, top, w, h), m: [1.0, 0.0, 0.0, 1.0], o: [0.0, 0.0, 1.0, 2.0], bg: [0.0, 0.0, 0.0, 0.55] }));
             quads.push((SLOT_CARD, Quad { rect: ndc(x, y, x + cw as f64, y + ch as f64), m: [1.0, 0.0, 0.0, 1.0], o: [0.0, 0.0, 1.0, 1.0], bg: [0.0; 4] }));
         }
+        quads.extend(self.tip_quad());
         let clear = if self.bg_mode == 3 { self.cfg.background } else { self.background() };
         match self.gpu.draw(clear, &quads) {
             Ok(true) => {

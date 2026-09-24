@@ -35,6 +35,7 @@ The resident open time is measured from the moment the running process receives 
 - Prefetching: neighbouring images are decoded ahead and kept on the GPU, so flipping costs one frame.
 - Zoom and pan, trilinear filtering when zoomed out and sharp bilinear when zoomed in. Rotation. EXIF orientation is applied without touching the pixel data.
 - Frameless window with its own caption, a bottom toolbar and fullscreen mode. Window size and position are restored per monitor.
+- Reference mode: pin the window on top of others, make it see-through (10-100 %), or open the current image in a separate window sized to it. Tooltips on every button.
 - Tray icon: a left click opens the image from the clipboard, a right click opens the menu.
 - One-click setup: install for the current user, start with Windows, and register as the default image viewer.
 
@@ -87,6 +88,9 @@ Command line:
 | B | Cycle the background: configured colour, black, light grey, checkerboard |
 | Delete | Move to the Recycle Bin |
 | O | Open a file |
+| T | Keep the window on top (pin) |
+| [ / ] | Opacity down / up; the caption's opacity button also takes a click, a drag or the wheel |
+| N | Open the current image in a separate window |
 | Esc | Leave fullscreen, or close |
 | Q | Close |
 
