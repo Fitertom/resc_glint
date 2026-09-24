@@ -8,7 +8,9 @@ Measured on an AMD Ryzen 7 5800X, NVIDIA GeForce RTX 3060, 48 GB RAM, Windows 11
 
 | Scenario | Time |
 |---|---|
-| Open a file in the resident process: path received to window on screen with the image | 4-6 ms |
+| Open a file in the resident process: request received to window on screen with the image | 3-5 ms |
+| Open through the shell (`ShellExecuteEx`, warm shell): call to window on screen | 12-16 ms |
+| Same, through a launcher process instead of `DelegateExecute`, for comparison | 22-28 ms |
 | Thumbnail placeholder, read directly from the Explorer thumbnail cache | ~1 ms |
 | Same placeholder through the Shell API (`IShellItemImageFactory`), for comparison | ~8 ms |
 | Switch to the next, already prefetched image | 1.2-1.9 ms |
@@ -23,7 +25,7 @@ Measured on an AMD Ryzen 7 5800X, NVIDIA GeForce RTX 3060, 48 GB RAM, Windows 11
 
 Most of a cold start is `vkCreateInstance` in the NVIDIA driver (~125 ms), which is outside the application's control. This is why Glint keeps a resident process by default (see below).
 
-The resident open time is measured from the moment the running process receives the path. When a file is opened from Explorer, a short-lived launcher process forwards the path first, and on the test system that adds 1-5 ms.
+The resident open time is measured from the moment the running process receives the request. The shell figures cover the whole path from a `ShellExecuteEx` call, which is what a double click in Explorer runs: association lookup and COM activation in Windows, then the open in Glint.
 
 ## Features
 
@@ -138,7 +140,7 @@ Settings live in `glint.ini` next to the executable. It is created with defaults
 
 ### Opening a file
 
-1. Explorer starts `glint.exe` with the path. If a resident instance is running, the new process hands the path over (`WM_COPYDATA`) and exits.
+1. Explorer resolves the "open" verb. Glint registers it with `DelegateExecute`, so no process is started: COM calls `IExecuteCommand::Execute` on the resident instance, through its message loop. If no instance is running, COM starts one with `-Embedding`. Launches from the command line use the older route: the new process hands the path to the resident instance (`WM_COPYDATA`) and exits.
 2. The resident process queues a thumbnail job and the preview decode for the file, and the thumbnail jobs for its neighbours. The folder is listed on a worker thread.
 3. The thumbnail comes from the Explorer cache in about 1 ms. It is uploaded and drawn together with the caption.
 4. The window, which stayed shown but cloaked through DWM, is uncloaked. This takes about 0.1 ms, against 3-18 ms for `ShowWindow` on a hidden window.

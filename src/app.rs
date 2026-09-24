@@ -566,7 +566,7 @@ impl App {
             })
         };
         let i = same.or_else(free).or_else(far)?;
-        if let Err(e) = self.gpu.upload(i, img.w, img.h, &img.px) {
+        if let Err(e) = self.gpu.upload_image(i, img.w, img.h, &img.px, !img.thumb) {
             self.error = Some(e);
             return None;
         }

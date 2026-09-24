@@ -58,6 +58,7 @@ fn main() {
     #[cfg(feature = "crashlog")]
     crashlog::install();
     let arg = std::env::args_os().nth(1);
+    let embedded = arg.as_ref().and_then(|a| a.to_str()).is_some_and(|a| a.eq_ignore_ascii_case("-Embedding") || a.eq_ignore_ascii_case("/Embedding"));
     // COM starts the server as `glint.exe -Embedding` when Explorer asks for it and no copy runs.
     let flag = arg.as_ref().and_then(|a| a.to_str()).filter(|a| a.starts_with("--") || a.eq_ignore_ascii_case("-Embedding") || a.eq_ignore_ascii_case("/Embedding")).map(|a| {
         if a.starts_with("--") { a.to_owned() } else { "--background".to_owned() }
@@ -98,7 +99,8 @@ fn main() {
         _ => {}
     }
     let background = flag.as_deref() == Some("--background");
-    if background && win::find_host().is_some() {
+    // (Started by COM, this copy must serve the call even beside a window that does not.)
+    if background && !embedded && win::find_host().is_some() {
         return;
     }
     let arg = if flag.is_some() { None } else { arg };
@@ -124,7 +126,7 @@ fn main() {
     loader.set_hwnd(hwnd as isize);
     // THE RESIDENT COPY SERVES EXPLORER'S "OPEN" ITSELF (`com_server`): a double click then
     // starts no process at all.
-    if cfg.resident {
+    if cfg.resident || embedded {
         com_server::register();
     }
     let gpu = match gpu::Gpu::new(hwnd as isize, win::client_size(hwnd), cfg.prefer_integrated) {

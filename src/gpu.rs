@@ -313,10 +313,16 @@ impl Gpu {
         }
     }
 
-    /// Premultiplied BGRA `w × h` into a slot, sent with the next frame. The image slot gets a
-    /// mip chain: without it a 6000-pixel photo shown at 1000 shimmers and aliases.
+    /// Premultiplied BGRA `w × h` into a slot, sent with the next frame.
     pub fn upload(&mut self, slot: usize, w: u32, h: u32, px: &[u8]) -> Result<(), String> {
-        let mips = if slot < IMAGE_SLOTS { 32 - w.max(h).leading_zeros() } else { 1 };
+        self.upload_image(slot, w, h, px, false)
+    }
+
+    /// The same, with a mip chain when `mipmapped`: without one a 6000-pixel photo shown at
+    /// 1000 shimmers and aliases. A thumbnail goes without: it is only ever shown enlarged,
+    /// and building the chain was most of the first frame's GPU work.
+    pub fn upload_image(&mut self, slot: usize, w: u32, h: u32, px: &[u8], mipmapped: bool) -> Result<(), String> {
+        let mips = if mipmapped { 32 - w.max(h).leading_zeros() } else { 1 };
         self.wait();
         self.uploads.retain(|u| u.slot != slot);
         let reuse = self.tex[slot].as_ref().is_some_and(|t| t.w == w && t.h == h && t.mips == mips);
