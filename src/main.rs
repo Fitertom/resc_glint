@@ -137,7 +137,7 @@ fn main() {
         None => app::Nav::empty(),
     };
     win::set_resident(cfg.resident);
-    let hwnd = match win::create("Glint", cfg.colorref(), cfg.window == config::WindowMode::Maximized, !background, cfg.placement) {
+    let hwnd = match win::create("Glint", cfg.colorref(), cfg.window == config::WindowMode::Maximized, !background, cfg.placement, cfg.blur) {
         Ok(h) => h,
         Err(e) => return fail(&e),
     };
@@ -148,7 +148,7 @@ fn main() {
     if cfg.resident || embedded {
         com_server::register();
     }
-    let gpu = match gpu::Gpu::new(hwnd as isize, win::client_size(hwnd), cfg.prefer_integrated) {
+    let gpu = match gpu::Gpu::new(hwnd as isize, win::client_size(hwnd), cfg.prefer_integrated, cfg.blur) {
         Ok(g) => g,
         Err(e) => return fail(&e),
     };

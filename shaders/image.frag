@@ -5,6 +5,26 @@ layout(location = 0) in vec2 uv;
 layout(location = 0) out vec4 outc;
 
 void main() {
+    if (p.o.w > 2.5) {
+        // Frosted glass: the photo under the toolbar, blurred. o.w - 3 is the corner radius,
+        // bg the bar's rectangle in pixels. The blur comes from the mip chain: a level about
+        // half the radius wide, then a spiral of taps over it, so a wide blur costs 16 reads.
+        vec2 size = vec2(textureSize(tex, 0));
+        float r = 22.0 / max(p.o.z, 1e-4); // radius in texels; o.z = screen pixels per texel
+        float lod = max(log2(r * 0.35), 0.0);
+        vec4 acc = vec4(0.0);
+        for (int i = 0; i < 16; i++) {
+            float k = (float(i) + 0.5) / 16.0;
+            float a = float(i) * 2.39996; // golden angle
+            acc += textureLod(tex, uv + vec2(cos(a), sin(a)) * sqrt(k) * r / size, lod);
+        }
+        acc /= 16.0;
+        float rad = p.o.w - 3.0;
+        vec2 q = abs(gl_FragCoord.xy - (p.bg.xy + p.bg.zw) * 0.5) - (p.bg.zw - p.bg.xy) * 0.5 + rad;
+        float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - rad;
+        outc = acc * clamp(0.5 - d, 0.0, 1.0); // premultiplied, blended by the pipeline
+        return;
+    }
     if (p.o.w > 1.5) { // a flat premultiplied colour: the shade behind the setup card
         outc = p.bg;
         return;

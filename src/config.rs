@@ -38,6 +38,12 @@ pub struct Config {
     /// Where the window was when it was last closed: left, top, right, bottom of its normal
     /// (not maximised) rectangle in screen pixels, and whether it was maximised.
     pub placement: Option<([i32; 4], bool)>,
+    /// Blur what is behind the window, as ExplorerBlurMica does for Explorer; the photo
+    /// stays opaque, the ground around it and the caption are glass.
+    pub blur: bool,
+    /// The shade over the blur, and how much of it (0..1).
+    pub tint: [f32; 3],
+    pub tint_alpha: f32,
 }
 
 const DEFAULT: &str = "\
@@ -68,6 +74,11 @@ implicit_layers = false
 resident = true
 # while hidden: give memory back (~2 MB, opening pages it back in) or keep it (faster open)
 trim_memory = true
+# blur what is behind the window, as ExplorerBlurMica does for Explorer
+blur = true
+# the shade over the blur: hex RRGGBB, and how much of it 0..255
+tint = 2e2e2e
+tint_alpha = 120
 ";
 
 impl Config {
@@ -96,10 +107,15 @@ impl Config {
             trim_memory: true,
             setup_done: false,
             placement: None,
+            blur: true,
+            tint: [0.18, 0.18, 0.18],
+            tint_alpha: 120.0 / 255.0,
         };
         for line in text.lines() {
             let line = line.split('#').next().unwrap_or("");
-            let Some((k, v)) = line.split_once('=') else { continue };
+            let Some((k, v)) = line.split_once('=') else {
+                continue;
+            };
             let (k, v) = (k.trim(), v.trim());
             let yes = matches!(v, "true" | "1" | "yes" | "on");
             match k {
@@ -127,6 +143,13 @@ impl Config {
                 "resident" => c.resident = yes,
                 "trim_memory" => c.trim_memory = yes,
                 "setup_done" => c.setup_done = yes,
+                "blur" => c.blur = yes,
+                "tint" => {
+                    if let Ok(x) = u32::from_str_radix(v.trim_start_matches('#'), 16) {
+                        c.tint = [(x >> 16 & 255) as f32 / 255.0, (x >> 8 & 255) as f32 / 255.0, (x & 255) as f32 / 255.0];
+                    }
+                }
+                "tint_alpha" => c.tint_alpha = v.parse::<f32>().map_or(120.0 / 255.0, |a| (a / 255.0).clamp(0.0, 1.0)),
                 "placement" => {
                     let v: Vec<i32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
                     if let [l, t, r, b, m] = v[..] {
@@ -137,6 +160,12 @@ impl Config {
             }
         }
         c
+    }
+
+    /// The tint as premultiplied RGBA, the ground the photo floats on over the blur.
+    pub fn glass(&self) -> [f32; 4] {
+        let a = self.tint_alpha;
+        [self.tint[0] * a, self.tint[1] * a, self.tint[2] * a, a]
     }
 
     /// Background as a GDI `COLORREF`, for the window class brush shown before the first frame.

@@ -90,6 +90,8 @@ pub struct Panel<T> {
 }
 
 pub struct Painter {
+    /// The window is glass (the blur is on): the caption is drawn with alpha, without a ground.
+    glass: bool,
     dc: HDC,
     bmp: HBITMAP,
     bits: *mut u8,
@@ -108,6 +110,11 @@ pub struct Painter {
 
 pub fn scaled(v: i32, dpi: u32) -> i32 {
     (v * dpi as i32 + 48) / 96
+}
+
+/// The toolbar's corner radius in pixels.
+pub fn bar_radius(dpi: u32) -> i32 {
+    scaled(10, dpi)
 }
 
 pub fn caption_h(dpi: u32) -> i32 {
@@ -137,10 +144,11 @@ pub fn button_at(x: i32, y: i32, width: i32, dpi: u32) -> Option<Button> {
 }
 
 impl Painter {
-    pub fn new() -> Painter {
+    pub fn new(glass: bool) -> Painter {
         // SAFETY: a memory DC of our own.
         let dc = unsafe { CreateCompatibleDC(std::ptr::null_mut()) };
         let mut p = Painter {
+            glass,
             dc,
             bmp: std::ptr::null_mut(),
             bits: std::ptr::null_mut(),
@@ -170,15 +178,18 @@ impl Painter {
                     DeleteObject(f);
                 }
             }
-            self.text = font(scaled(TEXT_PX, dpi), "Segoe UI", CLEARTYPE_QUALITY as u32);
+            // The caption's text: ClearType over its own opaque ground; grayscale on glass, where
+            // the ground is a blur and coloured fringes would stay coloured.
+            let q = if self.glass { ANTIALIASED_QUALITY } else { CLEARTYPE_QUALITY } as u32;
+            self.text = font(scaled(TEXT_PX, dpi), "Segoe UI", q);
             // The caption glyphs of Windows 11, or of Windows 10 where that font is missing.
-            self.icons = font(scaled(10, dpi), "Segoe Fluent Icons", CLEARTYPE_QUALITY as u32);
+            self.icons = font(scaled(10, dpi), "Segoe Fluent Icons", q);
             SelectObject(self.dc, self.icons);
             let mut face = [0u16; 64];
             let n = GetTextFaceW(self.dc, face.len() as i32, face.as_mut_ptr());
             if String::from_utf16_lossy(&face[..n.max(1) as usize - 1]) != "Segoe Fluent Icons" {
                 DeleteObject(self.icons);
-                self.icons = font(scaled(10, dpi), "Segoe MDL2 Assets", CLEARTYPE_QUALITY as u32);
+                self.icons = font(scaled(10, dpi), "Segoe MDL2 Assets", q);
             }
             self.bar_glyphs = font(scaled(16, dpi), self.icon_face(), CLEARTYPE_QUALITY as u32);
             self.bar_text = font(scaled(13, dpi), "Segoe UI", CLEARTYPE_QUALITY as u32);
@@ -270,13 +281,48 @@ impl Painter {
     }
 
     /// The caption: logo, file name, info at the right, then minimise / maximise / close.
+    ///
+    /// **On glass** (the blur on) the caption has no ground of its own: the window's tint is
+    /// under it, as under the photo, so caption and window are one surface as in Explorer.
+    /// GDI writes no alpha, so it is drawn twice, over black and over white: where nothing was
+    /// drawn the two differ by 255, where something opaque was they agree, and every
+    /// antialiased edge in between gives its own coverage. The black pass already is the
+    /// colour premultiplied.
     #[allow(clippy::too_many_arguments)]
     pub fn caption(&mut self, dpi: u32, width: i32, title: &str, info: &str, hot: Option<Button>, pressed: bool, maximized: bool, pinned: bool, opacity: f32) -> Vec<u8> {
         self.set_dpi(dpi);
         let h = caption_h(dpi);
         self.canvas(width, h);
+        let pad = scaled(10, dpi);
+        let ly = (h - self.logo_px) / 2;
+        if !self.glass {
+            self.caption_body(CHROME_BG, dpi, width, title, info, hot, pressed, maximized, pinned, opacity);
+            let mut px = self.take(width, h);
+            blend(&mut px, width as usize, &self.logo, self.logo_px as usize, pad as usize, ly as usize);
+            px.chunks_exact_mut(4).for_each(|p| p[3] = 255); // GDI leaves alpha at zero
+            return px;
+        }
+        self.caption_body((0, 0, 0), dpi, width, title, info, hot, pressed, maximized, pinned, opacity);
+        let mut px = self.take(width, h);
+        self.caption_body((255, 255, 255), dpi, width, title, info, hot, pressed, maximized, pinned, opacity);
+        let white = self.take(width, h);
+        for (p, w) in px.chunks_exact_mut(4).zip(white.chunks_exact(4)) {
+            let spread = (w[0] as u32 + w[1] as u32 + w[2] as u32).saturating_sub(p[0] as u32 + p[1] as u32 + p[2] as u32) / 3;
+            let a = 255 - spread.min(255) as u8;
+            for c in 0..3 {
+                p[c] = p[c].min(a);
+            }
+            p[3] = a;
+        }
+        blend(&mut px, width as usize, &self.logo, self.logo_px as usize, pad as usize, ly as usize);
+        px
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn caption_body(&self, ground: Rgb, dpi: u32, width: i32, title: &str, info: &str, hot: Option<Button>, pressed: bool, maximized: bool, pinned: bool, opacity: f32) {
+        let h = caption_h(dpi);
         let rect = |l, r| RECT { left: l, top: 0, right: r, bottom: h };
-        self.fill(rect(0, width), CHROME_BG);
+        self.fill(rect(0, width), ground);
 
         let bw = scaled(BUTTON_W, dpi);
         let x0 = width - bw * BUTTONS.len() as i32;
@@ -311,12 +357,6 @@ impl Painter {
         if title_r > title_x {
             self.text(title, self.text, TEXT, rect(title_x, title_r), DT_LEFT | DT_END_ELLIPSIS);
         }
-
-        let mut px = self.take(width, h);
-        let ly = (h - self.logo_px) / 2;
-        blend(&mut px, width as usize, &self.logo, self.logo_px as usize, pad as usize, ly as usize);
-        px.chunks_exact_mut(4).for_each(|p| p[3] = 255); // GDI leaves alpha at zero
-        px
     }
 
     /// The setup card: what makes the viewer part of Windows, one row each, and one button.
@@ -400,8 +440,8 @@ impl Painter {
     pub fn toolbar(&mut self, dpi: u32, hot: Option<Tool>, fullscreen: bool, zoom: &str) -> Panel<Tool> {
         self.set_dpi(dpi);
         let s = |v| scaled(v, dpi);
+        // Previous / next are not here: they are the arrows at the window's sides.
         let groups: &[&[Tool]] = &[
-            &[Tool::Prev, Tool::Next],
             &[Tool::ZoomOut, Tool::ZoomIn],
             &[Tool::Fit, Tool::Actual],
             &[Tool::Rotate, Tool::Fullscreen],
@@ -459,8 +499,41 @@ impl Painter {
             }
         }
         let mut px = self.take(w, h);
-        panel_mask(&mut px, w, h, s(10) as f32, 0.94);
+        // On glass the photo under the bar is blurred by the GPU, and the bar lets more of it through.
+        panel_mask(&mut px, w, h, bar_radius(dpi) as f32, if self.glass { 0.7 } else { 0.94 });
         Panel { w: w as u32, h: h as u32, px, items }
+    }
+
+    /// The arrow shown at a side of the window while the pointer is there: previous or next
+    /// image. Only the chevron, white, with a soft shadow so it reads on a light photo too;
+    /// the whole strip along that side is what takes the click.
+    pub fn arrow(&mut self, dpi: u32, next: bool) -> Panel<Tool> {
+        self.set_dpi(dpi);
+        let (w, h) = (scaled(48, dpi), scaled(72, dpi));
+        self.canvas(w, h);
+        let full = RECT { left: 0, top: 0, right: w, bottom: h };
+        self.fill(full, (0, 0, 0));
+        let glyph = if next { '\u{E76C}' } else { '\u{E76B}' };
+        // SAFETY: a font of our own, deleted right after use.
+        unsafe {
+            let f = font(scaled(26, dpi), self.icon_face(), ANTIALIASED_QUALITY as u32);
+            self.text(&glyph.to_string(), f, (255, 255, 255), full, DT_CENTER);
+            DeleteObject(f);
+        }
+        let mut px = self.take(w, h);
+        let (wu, hu) = (w as usize, h as usize);
+        let cover: Vec<f32> = px.chunks_exact(4).map(|p| p[1] as f32 / 255.0).collect();
+        let r = scaled(5, dpi).max(1) as usize;
+        let shadow = box_blur(&box_blur(&cover, wu, hu, r), wu, hu, r);
+        for ((p, &g), &s) in px.chunks_exact_mut(4).zip(&cover).zip(&shadow) {
+            let a = g + (s * 0.6).min(1.0) * (1.0 - g);
+            let c = (g * 255.0).round() as u8;
+            p[0] = c;
+            p[1] = c;
+            p[2] = c;
+            p[3] = (a * 255.0).round() as u8;
+        }
+        Panel { w: w as u32, h: h as u32, px, items: vec![(if next { Tool::Next } else { Tool::Prev }, full)] }
     }
 
     /// The icon font there is: Windows 11's, or Windows 10's.
@@ -583,6 +656,26 @@ fn panel_mask(px: &mut [u8], w: i32, h: i32, radius: f32, opacity: f32) {
     }
 }
 
+/// A box blur of a coverage map, rows then columns, `r` pixels each way; twice is near Gaussian.
+fn box_blur(v: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
+    let n = (2 * r + 1) as f32;
+    let mut tmp = vec![0.0; v.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let (a, b) = (x.saturating_sub(r), (x + r).min(w - 1));
+            tmp[y * w + x] = v[y * w + a..=y * w + b].iter().sum::<f32>() / n;
+        }
+    }
+    let mut out = vec![0.0; v.len()];
+    for y in 0..h {
+        let (a, b) = (y.saturating_sub(r), (y + r).min(h - 1));
+        for x in 0..w {
+            out[y * w + x] = (a..=b).map(|yy| tmp[yy * w + x]).sum::<f32>() / n;
+        }
+    }
+    out
+}
+
 fn rgb(c: Rgb) -> u32 {
     c.0 as u32 | (c.1 as u32) << 8 | (c.2 as u32) << 16
 }
@@ -627,9 +720,12 @@ fn blend(dst: &mut [u8], width: usize, src: &[u8], side: usize, x: usize, y: usi
         for sx in 0..side {
             let s = &src[(sy * side + sx) * 4..][..4];
             let o = ((y + sy) * width + x + sx) * 4;
-            let Some(d) = dst.get_mut(o..o + 4) else { continue };
+            let Some(d) = dst.get_mut(o..o + 4) else {
+                continue;
+            };
             let inv = 255 - s[3] as u32;
-            for c in 0..3 {
+            // All four: on glass the caption under the logo is itself see-through.
+            for c in 0..4 {
                 d[c] = (s[c] as u32 + (d[c] as u32 * inv + 127) / 255).min(255) as u8;
             }
         }

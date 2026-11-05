@@ -16,7 +16,9 @@ pub const SLOT_INFO: usize = IMAGE_SLOTS + 1;
 pub const SLOT_CARD: usize = IMAGE_SLOTS + 2;
 pub const SLOT_BAR: usize = IMAGE_SLOTS + 3;
 pub const SLOT_TIP: usize = IMAGE_SLOTS + 4;
-const SLOTS: usize = IMAGE_SLOTS + 5;
+pub const SLOT_PREV: usize = IMAGE_SLOTS + 5;
+pub const SLOT_NEXT: usize = IMAGE_SLOTS + 6;
+const SLOTS: usize = IMAGE_SLOTS + 7;
 
 /// The staging buffer kept while hidden, and the least one made: a thumbnail, a caption and a
 /// screen-sized preview fit.
@@ -107,6 +109,11 @@ pub struct Gpu {
     small: std::cell::RefCell<Vec<(vk::DeviceMemory, u32)>>,
     want_rebuild: bool,
     wanted: (u32, u32),
+    /// The window floats over a blur: the swapchain hands DWM premultiplied alpha, where the
+    /// driver offers it (NVIDIA does on Windows). Otherwise opaque, as before.
+    transparent: bool,
+    /// Photo quads are drawn below this row (the caption's height on glass, else 0).
+    pub photo_top: u32,
 }
 
 fn vkerr(what: &str) -> impl Fn(vk::Result) -> String + '_ {
@@ -114,7 +121,7 @@ fn vkerr(what: &str) -> impl Fn(vk::Result) -> String + '_ {
 }
 
 impl Gpu {
-    pub fn new(hwnd: isize, size: (u32, u32), prefer_integrated: bool) -> Result<Gpu, String> {
+    pub fn new(hwnd: isize, size: (u32, u32), prefer_integrated: bool, transparent: bool) -> Result<Gpu, String> {
         // SAFETY: the Vulkan calls below follow the spec's order; every handle made here is
         // destroyed in `Drop`, after the device is idle.
         unsafe {
@@ -266,6 +273,8 @@ impl Gpu {
                 small: Default::default(),
                 want_rebuild: false,
                 wanted: size,
+                transparent,
+                photo_top: 0,
             };
             crate::trace("vk: pipeline");
             g.rebuild()?;
@@ -349,8 +358,9 @@ impl Gpu {
     }
 
     /// Draw the quads, each with its slot's texture, and show the frame. False when there is
-    /// nothing to draw into (minimised) — the caller asks again on the next change.
-    pub fn draw(&mut self, clear: [f32; 3], quads: &[(usize, Quad)]) -> Result<bool, String> {
+    /// nothing to draw into (minimised) — the caller asks again on the next change. `clear` is
+    /// premultiplied RGBA: below 1 alpha, the blur behind the window shows through.
+    pub fn draw(&mut self, clear: [f32; 4], quads: &[(usize, Quad)]) -> Result<bool, String> {
         // An out-of-date swapchain is rebuilt and the frame tried once more: nothing else
         // would ask for it until the next event.
         match self.draw_once(clear, quads)? {
@@ -359,7 +369,7 @@ impl Gpu {
         }
     }
 
-    fn draw_once(&mut self, clear: [f32; 3], quads: &[(usize, Quad)]) -> Result<bool, String> {
+    fn draw_once(&mut self, clear: [f32; 4], quads: &[(usize, Quad)]) -> Result<bool, String> {
         // SAFETY: one frame in flight: after the fence, nothing recorded before is running.
         unsafe {
             if self.want_rebuild {
@@ -400,16 +410,26 @@ impl Gpu {
                 .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                 .load_op(vk::AttachmentLoadOp::CLEAR)
                 .store_op(vk::AttachmentStoreOp::STORE)
-                .clear_value(vk::ClearValue { color: vk::ClearColorValue { float32: [clear[0], clear[1], clear[2], 1.0] } })];
+                .clear_value(vk::ClearValue { color: vk::ClearColorValue { float32: clear } })];
             let area = vk::Rect2D { offset: vk::Offset2D::default(), extent: self.extent };
             d.cmd_begin_rendering(cmd, &vk::RenderingInfo::default().render_area(area).layer_count(1).color_attachments(&att));
             let vp = vk::Viewport { x: 0.0, y: 0.0, width: self.extent.width as f32, height: self.extent.height as f32, min_depth: 0.0, max_depth: 1.0 };
             d.cmd_set_viewport(cmd, 0, &[vp]);
             d.cmd_set_scissor(cmd, 0, &[area]);
             d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
+            // On glass the caption has no ground, so a zoomed photo is cut at its lower edge
+            // instead of showing through it; overlays (o.w set) are drawn over the whole frame.
+            let top = self.photo_top.min(self.extent.height);
+            let below = vk::Rect2D { offset: vk::Offset2D { x: 0, y: top as i32 }, extent: vk::Extent2D { width: self.extent.width, height: self.extent.height - top } };
+            let mut cut = false;
             for (slot, q) in quads {
                 if self.tex[*slot].is_none() {
                     continue;
+                }
+                let photo = q.o[3] < 0.5 && top > 0;
+                if photo != cut {
+                    d.cmd_set_scissor(cmd, 0, &[if photo { below } else { area }]);
+                    cut = photo;
                 }
                 d.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipe_layout, 0, &[self.sets[*slot]], &[]);
                 let bytes = std::slice::from_raw_parts((q as *const Quad).cast::<u8>(), size_of::<Quad>());
@@ -465,6 +485,8 @@ impl Gpu {
             self.want_rebuild = false;
             let _ = self.device.device_wait_idle();
             let caps = self.surface_fn.get_physical_device_surface_capabilities(self.pdev, self.surface).map_err(vkerr("caps"))?;
+            let premultiplied = vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED;
+            let alpha = if self.transparent && caps.supported_composite_alpha.contains(premultiplied) { premultiplied } else { vk::CompositeAlphaFlagsKHR::OPAQUE };
             let extent = if caps.current_extent.width != u32::MAX {
                 caps.current_extent
             } else {
@@ -495,7 +517,7 @@ impl Gpu {
                         .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
                         .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
                         .pre_transform(caps.current_transform)
-                        .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+                        .composite_alpha(alpha)
                         .present_mode(self.present_mode)
                         .clipped(true)
                         .old_swapchain(old),
@@ -663,7 +685,9 @@ impl Gpu {
             return;
         };
         for u in self.uploads.drain(..) {
-            let Some(t) = self.tex[u.slot].as_ref() else { continue };
+            let Some(t) = self.tex[u.slot].as_ref() else {
+                continue;
+            };
             // SAFETY: recording into our command buffer; the texture and buffer are live.
             unsafe {
                 let top = (vk::PipelineStageFlags2::TOP_OF_PIPE, vk::AccessFlags2::NONE);

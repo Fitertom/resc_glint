@@ -35,6 +35,8 @@ The resident open time is measured from the moment the running process receives 
 - Prefetching: neighbouring images are decoded ahead and kept on the GPU, so flipping costs one frame.
 - Zoom and pan, trilinear filtering when zoomed out and sharp bilinear when zoomed in. Rotation. EXIF orientation is applied without touching the pixel data.
 - Frameless window with its own caption, a bottom toolbar and fullscreen mode. Window size and position are restored per monitor.
+- Glass: the window blurs what is behind it, as ExplorerBlurMica does for Explorer. The caption and the ground around the photo are see-through, and the toolbar blurs the photo under it. Opening speed is unchanged (measured, see the key figures).
+- Previous / next: move the pointer to the left or right edge and an arrow appears; a click anywhere in that strip flips the image.
 - Reference mode: pin the window on top of others, make it see-through (10-100 %), or open the current image in a separate window sized to it. Tooltips on every button.
 - Tray icon: a left click opens the image from the clipboard, a right click opens the menu.
 - One-click setup: install for the current user, start with Windows, and register as the default image viewer.
@@ -78,6 +80,7 @@ Command line:
 | Input | Action |
 |---|---|
 | Right, Page Down, Space / Left, Page Up, Backspace | Next / previous image |
+| Click at the right / left edge of the window | Next / previous image |
 | Home / End | First / last image in the folder |
 | Mouse wheel, Up / Down, + / - | Zoom in / out at the cursor |
 | 0 | Fit to window |
@@ -85,7 +88,7 @@ Command line:
 | Double click, F, F11, Enter | Toggle fullscreen |
 | R / Shift+R or L | Rotate clockwise / counter-clockwise |
 | I, Tab | Toggle the info line |
-| B | Cycle the background: configured colour, black, light grey, checkerboard |
+| B | Cycle the background: glass (the configured colour with `blur = false`), black, light grey, checkerboard |
 | Delete | Move to the Recycle Bin |
 | O | Open a file |
 | T | Keep the window on top (pin) |
@@ -112,6 +115,8 @@ Settings live in `glint.ini` next to the executable. It is created with defaults
 | `implicit_layers` | `false` | Load implicit Vulkan layers (overlays); off for faster start |
 | `resident` | `true` | Stay in memory after the window is closed |
 | `trim_memory` | `true` | Release the working set while hidden |
+| `blur` | `true` | Blur what is behind the window (glass caption and background) |
+| `tint` / `tint_alpha` | `2e2e2e` / `120` | Shade over the blur, hex RRGGBB, and its strength 0-255 |
 
 ## Architecture
 

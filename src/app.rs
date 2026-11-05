@@ -2,7 +2,7 @@
 
 use crate::config::Config;
 use crate::files;
-use crate::gpu::{Gpu, IMAGE_SLOTS, Quad, SLOT_BAR, SLOT_CAPTION, SLOT_CARD, SLOT_INFO, SLOT_TIP};
+use crate::gpu::{Gpu, IMAGE_SLOTS, Quad, SLOT_BAR, SLOT_CAPTION, SLOT_CARD, SLOT_INFO, SLOT_NEXT, SLOT_PREV, SLOT_TIP};
 use crate::loader::{FULL, Key, Loader, Msg, PREVIEW, THUMB, drop_later};
 use crate::ui::{self, Button, CardItem, Painter, Tool};
 use crate::wic::Img;
@@ -25,6 +25,8 @@ const TIP_DELAY_MS: u32 = 450;
 const TIMER_TIP: usize = 1;
 /// Dragging the opacity button: this many pixels sideways go from 10 % to 100 %.
 const OPACITY_DRAG_PX: i32 = 220;
+/// Width of the strip at each side that shows an arrow and flips on a click, at 96 dpi.
+const SIDE_ZONE: i32 = 96;
 
 /// Zoom per wheel notch and per key press.
 const STEP: f64 = 1.2;
@@ -162,6 +164,9 @@ pub struct App {
     bar_at: (i32, i32),
     bar_items: Vec<(Tool, windows_sys::Win32::Foundation::RECT)>,
     bar_key: String,
+    /// The side strip the pointer is in (0 left, 1 right): its arrow shows, a click there flips.
+    side_hover: Option<usize>,
+    side_key: String,
     /// What the caption on the GPU shows: drawn again only when that changes.
     caption_key: String,
     /// Shown again, the window is maximised if it was when hidden.
@@ -204,12 +209,13 @@ impl App {
         loader.set_max_dim(gpu.max_dim);
         let size = win::client_size(hwnd);
         let info = cfg.info;
+        let painter = Painter::new(cfg.blur);
         let mut a = App {
             hwnd,
             gpu,
             loader,
             cfg,
-            painter: Painter::new(),
+            painter,
             nav,
             cache: HashMap::new(),
             keep: HashSet::new(),
@@ -248,6 +254,8 @@ impl App {
             bar_at: (0, 0),
             bar_items: Vec::new(),
             bar_key: String::new(),
+            side_hover: None,
+            side_key: String::new(),
             caption_key: String::new(),
             restore_max: win::placement(hwnd).1,
             relaunch: None,
@@ -300,7 +308,9 @@ impl App {
     }
 
     fn fit_zoom(&self) -> f64 {
-        let Some((w, h)) = self.dims() else { return 1.0 };
+        let Some((w, h)) = self.dims() else {
+            return 1.0;
+        };
         let (_, _, aw, ah) = self.area();
         let z = (aw / w).min(ah / h);
         if self.cfg.upscale_small { z } else { z.min(1.0) }
@@ -562,11 +572,15 @@ impl App {
             self.dirty = true;
             return;
         }
-        let Some(img) = slot.and_then(|s| s.best()).cloned() else { return };
+        let Some(img) = slot.and_then(|s| s.best()).cloned() else {
+            return;
+        };
         if self.shown.as_ref().is_some_and(|t| t.serves(&path, &img)) {
             return;
         }
-        let Some((gpu_slot, tex)) = self.on_gpu(&path, &img) else { return };
+        let Some((gpu_slot, tex)) = self.on_gpu(&path, &img) else {
+            return;
+        };
         self.shown_slot = gpu_slot;
         let new_file = self.shown.as_ref().is_none_or(|t| t.path != path);
         self.shown = Some(tex);
@@ -707,6 +721,7 @@ impl App {
                 let (l, r) = ui::button_x(b, self.size.0 as i32, self.dpi);
                 ((l + r) as f64 / 2.0, self.caption_h() as f64 + gap)
             }
+            Tip::Bar(Tool::Prev | Tool::Next) => return None, // the arrow says it
             Tip::Bar(tool) => {
                 let r = self.bar_items.iter().find(|(o, _)| *o == tool)?.1;
                 ((self.bar_at.0 + (r.left + r.right) / 2) as f64, self.bar_at.1 as f64 - gap - th)
@@ -1073,12 +1088,31 @@ impl App {
         y >= self.size.1 as i32 - ui::scaled(96, self.dpi)
     }
 
-    fn tool_at(&self, x: i32, y: i32) -> Option<Tool> {
-        if !self.bar_visible() || !self.gpu.has(SLOT_BAR) {
+    /// Which side strip the pointer is in, 0 left, 1 right: the full height below the caption,
+    /// as wide as the arrow's zone. Not over the bar, not for a single image.
+    fn side_at_point(&self, x: i32, y: i32) -> Option<usize> {
+        if self.setup.is_some() || self.nav.files.len() < 2 || y < self.caption_h() || y >= self.size.1 as i32 {
             return None;
         }
-        let (px, py) = (x - self.bar_at.0, y - self.bar_at.1);
-        self.bar_items.iter().find(|(_, r)| px >= r.left && px < r.right && py >= r.top && py < r.bottom).map(|(t, _)| *t)
+        let zone = ui::scaled(SIDE_ZONE, self.dpi);
+        if x >= 0 && x < zone {
+            Some(0)
+        } else if x >= self.size.0 as i32 - zone && x < self.size.0 as i32 {
+            Some(1)
+        } else {
+            None
+        }
+    }
+
+    fn tool_at(&self, x: i32, y: i32) -> Option<Tool> {
+        let bar = (|| {
+            if !self.bar_visible() || !self.gpu.has(SLOT_BAR) {
+                return None;
+            }
+            let (px, py) = (x - self.bar_at.0, y - self.bar_at.1);
+            self.bar_items.iter().find(|(_, r)| px >= r.left && px < r.right && py >= r.top && py < r.bottom).map(|(t, _)| *t)
+        })();
+        bar.or_else(|| self.side_at_point(x, y).map(|k| if k == 0 { Tool::Prev } else { Tool::Next }))
     }
 
     fn tool(&mut self, t: Tool) {
@@ -1212,6 +1246,22 @@ impl App {
         }
         out
     }
+}
+
+/// The photo's quad cut down to where it is under the toolbar (`rect` in NDC, `px` the same in
+/// pixels), drawn blurred there: frosted glass over the photo, as the blur is over the desktop.
+/// The uv map is narrowed with it, so the cut-out shows exactly the pixels it covers.
+fn frost(photo: &Quad, rect: [f32; 4], px: [f32; 4], radius: f32) -> Option<Quad> {
+    let p = photo.rect;
+    let i = [p[0].max(rect[0]), p[1].max(rect[1]), p[2].min(rect[2]), p[3].min(rect[3])];
+    if i[0] >= i[2] || i[1] >= i[3] {
+        return None;
+    }
+    let c = |v: f32, a: f32, b: f32| (v - a) / (b - a);
+    let (c0, c1) = ([c(i[0], p[0], p[2]), c(i[1], p[1], p[3])], [c(i[2], p[0], p[2]), c(i[3], p[1], p[3])]);
+    let (dx, dy) = (c1[0] - c0[0], c1[1] - c0[1]);
+    let m = photo.m;
+    Some(Quad { rect: i, m: [m[0] * dx, m[1] * dx, m[2] * dy, m[3] * dy], o: [photo.o[0] + m[0] * c0[0] + m[2] * c0[1], photo.o[1] + m[1] * c0[0] + m[3] * c0[1], photo.o[2], 3.0 + radius], bg: px })
 }
 
 /// The corner → uv map for an EXIF orientation and `rot` user quarter turns clockwise, as the
@@ -1351,7 +1401,9 @@ impl App {
             }
             Ev::Wheel { .. } if self.setup.is_some() => {}
             Ev::MouseMove(x, _) if self.opacity_drag.is_some() => {
-                let Some((sx, start, moved)) = self.opacity_drag else { return };
+                let Some((sx, start, moved)) = self.opacity_drag else {
+                    return;
+                };
                 let dx = x - sx;
                 let moved = moved || dx.abs() > ui::scaled(3, self.dpi);
                 self.opacity_drag = Some((sx, start, moved));
@@ -1365,6 +1417,11 @@ impl App {
                 let hover = self.drag.is_none() && self.in_bar_zone(y);
                 if hover != self.bar_hover {
                     self.bar_hover = hover;
+                    self.dirty = true;
+                }
+                let side = if self.drag.is_none() { self.side_at_point(x, y) } else { None };
+                if side != self.side_hover {
+                    self.side_hover = side;
                     self.dirty = true;
                 }
                 let tool = self.tool_at(x, y);
@@ -1388,8 +1445,9 @@ impl App {
                 }
             }
             Ev::MouseLeave => {
-                if self.bar_hover || self.bar_hot.is_some() {
+                if self.bar_hover || self.side_hover.is_some() || self.bar_hot.is_some() {
                     self.bar_hover = false;
+                    self.side_hover = None;
                     self.bar_hot = None;
                     self.dirty = true;
                 }
@@ -1578,7 +1636,34 @@ impl App {
             let y = h - bh as f64 - ui::scaled(16, self.dpi) as f64;
             self.bar_at = (x as i32, y as i32);
             let ndc = |x0: f64, y0: f64, x1: f64, y1: f64| [(x0 / w * 2.0 - 1.0) as f32, (y0 / h * 2.0 - 1.0) as f32, (x1 / w * 2.0 - 1.0) as f32, (y1 / h * 2.0 - 1.0) as f32];
-            quads.push((SLOT_BAR, Quad { rect: ndc(x, y, x + bw as f64, y + bh as f64), m: [1.0, 0.0, 0.0, 1.0], o: [0.0, 0.0, 1.0, 1.0], bg: [0.0; 4] }));
+            let rect = ndc(x, y, x + bw as f64, y + bh as f64);
+            if self.cfg.blur {
+                let px = [x as f32, y as f32, (x + bw as f64) as f32, (y + bh as f64) as f32];
+                if let Some(f) = quads.iter().find(|(s, q)| *s == self.shown_slot && q.o[3] < 0.5).and_then(|(_, q)| frost(q, rect, px, ui::bar_radius(self.dpi) as f32)) {
+                    quads.push((self.shown_slot, f));
+                }
+            }
+            quads.push((SLOT_BAR, Quad { rect, m: [1.0, 0.0, 0.0, 1.0], o: [0.0, 0.0, 1.0, 1.0], bg: [0.0; 4] }));
+        }
+        if let Some(k) = self.side_hover.filter(|_| self.side_at_point(self.mouse.0, self.mouse.1).is_some()) {
+            let slot = if k == 0 { SLOT_PREV } else { SLOT_NEXT };
+            let key = format!("{}", self.dpi);
+            if key != self.side_key || !self.gpu.has(SLOT_PREV) || !self.gpu.has(SLOT_NEXT) {
+                for (s, next) in [(SLOT_PREV, false), (SLOT_NEXT, true)] {
+                    let a = self.painter.arrow(self.dpi, next);
+                    let _ = self.gpu.upload(s, a.w, a.h, &a.px);
+                }
+                self.side_key = key;
+            }
+            let (aw, ah) = self.gpu.size_of(slot);
+            let (w, h) = (self.size.0 as f64, self.size.1 as f64);
+            let (aw, ah) = (aw as f64, ah as f64);
+            let zone = ui::scaled(SIDE_ZONE, self.dpi) as f64;
+            let cap = self.caption_h() as f64;
+            let x = ((if k == 0 { zone / 2.0 } else { w - zone / 2.0 }) - aw / 2.0).round();
+            let y = (cap + (h - cap - ah) / 2.0).round();
+            let ndc = |x0: f64, y0: f64, x1: f64, y1: f64| [(x0 / w * 2.0 - 1.0) as f32, (y0 / h * 2.0 - 1.0) as f32, (x1 / w * 2.0 - 1.0) as f32, (y1 / h * 2.0 - 1.0) as f32];
+            quads.push((slot, Quad { rect: ndc(x, y, x + aw, y + ah), m: [1.0, 0.0, 0.0, 1.0], o: [0.0, 0.0, 1.0, 1.0], bg: [0.0; 4] }));
         }
         tr("bar");
         let top = self.caption_h() as f64;
@@ -1605,7 +1690,16 @@ impl App {
             quads.push((SLOT_CARD, Quad { rect: ndc(x, y, x + cw as f64, y + ch as f64), m: [1.0, 0.0, 0.0, 1.0], o: [0.0, 0.0, 1.0, 1.0], bg: [0.0; 4] }));
         }
         quads.extend(self.tip_quad());
-        let clear = if self.bg_mode == 3 { self.cfg.background } else { self.background() };
+        // On glass the ground is the tint over the blur (premultiplied); the black / light /
+        // checker grounds the user picks with B stay opaque.
+        let glass = self.cfg.blur && self.bg_mode == 0;
+        let clear = if glass {
+            self.cfg.glass()
+        } else {
+            let c = if self.bg_mode == 3 { self.cfg.background } else { self.background() };
+            [c[0], c[1], c[2], 1.0]
+        };
+        self.gpu.photo_top = if self.cfg.blur { self.caption_h().max(0) as u32 } else { 0 };
         match self.gpu.draw(clear, &quads) {
             Ok(true) => {
                 self.dirty = false;

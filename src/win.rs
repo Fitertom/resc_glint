@@ -466,7 +466,36 @@ pub fn dpi_aware() {
 
 /// Make the window. Shown at once: the class brush paints the background colour until the first
 /// frame, so the user sees the window as soon as the process starts.
-pub fn create(title: &str, bg: u32, maximized: bool, visible: bool, placement: Option<([i32; 4], bool)>) -> Result<HWND, String> {
+#[repr(C)]
+struct AccentPolicy {
+    state: i32,
+    flags: i32,
+    gradient: u32,
+    animation: i32,
+}
+
+#[repr(C)]
+struct CompositionData {
+    attribute: i32,
+    data: *mut std::ffi::c_void,
+    size: usize,
+}
+
+windows_link::link!("user32.dll" "system" fn SetWindowCompositionAttribute(hwnd: HWND, data: *mut CompositionData) -> i32);
+
+/// The blur behind the window, as ExplorerBlurMica's "Blur" effect (and Glint Calendar's):
+/// ACCENT_ENABLE_BLURBEHIND through WCA_ACCENT_POLICY, over a frame extended across the whole
+/// client area so the compositor reads the swapchain's alpha. FLAGS ZERO, NO GRADIENT: with
+/// the gradient flag the compositor filled the window black instead (checked on this machine).
+/// The tint is drawn by us, as the clear colour.
+fn blur_behind(hwnd: HWND) {
+    let mut accent = AccentPolicy { state: 3, flags: 0, gradient: 0, animation: 0 };
+    let mut data = CompositionData { attribute: 19, data: (&mut accent as *mut AccentPolicy).cast(), size: size_of::<AccentPolicy>() };
+    // SAFETY: both structs live through the call.
+    unsafe { SetWindowCompositionAttribute(hwnd, &mut data) };
+}
+
+pub fn create(title: &str, bg: u32, maximized: bool, visible: bool, placement: Option<([i32; 4], bool)>, blur: bool) -> Result<HWND, String> {
     // SAFETY: every struct is filled here and every string outlives its call.
     unsafe {
         let hinst = GetModuleHandleW(std::ptr::null());
@@ -525,9 +554,14 @@ pub fn create(title: &str, bg: u32, maximized: bool, visible: bool, placement: O
         attr(20, &on); // DWMWA_USE_IMMERSIVE_DARK_MODE: the system menu and snap previews go dark
         attr(33, &2); // DWMWA_WINDOW_CORNER_PREFERENCE = round
         attr(34, &(crate::ui::CHROME_BG_REF as i32)); // DWMWA_BORDER_COLOR: the caption's own colour
-        // A one-pixel frame left to the compositor: that is what it draws the shadow from.
+        // A one-pixel frame left to the compositor: that is what it draws the shadow from. Not
+        // the whole window even with the blur: frame there would get the system's own caption
+        // buttons drawn under ours, and the accent blurs the client area by itself.
         let m = MARGINS { cxLeftWidth: 0, cxRightWidth: 0, cyTopHeight: 1, cyBottomHeight: 0 };
         DwmExtendFrameIntoClientArea(hwnd, &m);
+        if blur {
+            blur_behind(hwnd);
+        }
         SetWindowPos(hwnd, std::ptr::null_mut(), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
         // WHERE IT WAS CLOSED, if that monitor is still there; the settings' mode otherwise.
         let (rect, max) = placement.unwrap_or(([0; 4], maximized));
